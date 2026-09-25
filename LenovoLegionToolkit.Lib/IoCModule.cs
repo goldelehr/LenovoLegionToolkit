@@ -133,6 +133,7 @@ public class IoCModule : Module
         builder.Register<AIController>();
         builder.Register<DisplayBrightnessController>();
         builder.Register<GodModeController>();
+        builder.Register<SoftwareFanCurveController>();
         builder.Register<GPUController>();
         builder.Register<GPUOverclockController>();
         builder.Register<RGBKeyboardBacklightController>();

@@ -19,7 +19,8 @@ public class GodModeController(
     GodModeSettings settings,
     VantageDisabler vantageDisabler,
     LegionZoneDisabler legionZoneDisabler,
-    LegionSpaceDisabler legionSpaceDisabler)
+    LegionSpaceDisabler legionSpaceDisabler,
+    SoftwareFanCurveController softwareFanCurveController)
     : IGodModeController
 {
     private const uint CAPABILITY_ID_MASK = 0xFFFF00FF;
@@ -407,6 +408,8 @@ public class GodModeController(
     {
         if (fanFullSpeed)
         {
+            await softwareFanCurveController.StopAsync().ConfigureAwait(false);
+
             try
             {
                 Log.Instance.Trace($"Applying Fan Full Speed...");
@@ -431,12 +434,21 @@ public class GodModeController(
                 throw;
             }
 
+            Log.Instance.Trace($"Waiting for power mode set successfully...");
+            await Task.Delay(TimeSpan.FromMilliseconds(500)).ConfigureAwait(false);
+
+            if (await TryStartSoftwareFanCurveAsync(fanTable).ConfigureAwait(false))
+                return;
+
             try
             {
-                Log.Instance.Trace($"Waiting for power mode set successfully...");
-                await Task.Delay(TimeSpan.FromMilliseconds(500)).ConfigureAwait(false);
-
                 Log.Instance.Trace($"Applying Fan Table {fanTable}...");
+                if (!await IsValidFanTableAsync(fanTable).ConfigureAwait(false))
+                {
+                    fanTable = await ClampToMinimumFanTableAsync(fanTable).ConfigureAwait(false);
+                    Log.Instance.Trace($"Fan table below hardware minimum, clamped to {fanTable}...");
+                }
+
                 if (!await IsValidFanTableAsync(fanTable).ConfigureAwait(false))
                 {
                     Log.Instance.Trace($"Fan table invalid, replacing with default...");
@@ -451,6 +463,38 @@ public class GodModeController(
                 throw;
             }
         }
+    }
+
+    /// <summary>
+    /// Starts the software fan curve when the BIOS refused to enter the custom thermal mode, in which case
+    /// the EC ignores Fan_Set_Table anyway. Otherwise makes sure the software fan curve is stopped.
+    /// </summary>
+    private async Task<bool> TryStartSoftwareFanCurveAsync(FanTable fanTable)
+    {
+        try
+        {
+            if (await SoftwareFanCurveController.IsHardwareCustomModeBlockedAsync().ConfigureAwait(false)
+                && await GetFanTableDataLegionAsync().ConfigureAwait(false) is { } fanTableData)
+            {
+                Log.Instance.Trace($"BIOS did not enter custom thermal mode (power adapter not recognized?), using software fan curve.");
+                await softwareFanCurveController.StartAsync(fanTable, fanTableData).ConfigureAwait(false);
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Instance.Trace($"Failed to start software fan curve.", ex);
+        }
+
+        await softwareFanCurveController.StopAsync().ConfigureAwait(false);
+        return false;
+    }
+
+    private async Task<FanTable> ClampToMinimumFanTableAsync(FanTable fanTable)
+    {
+        var minimum = (await GetHardwareMinimumFanTableAsync().ConfigureAwait(false)).GetTable();
+        var table = fanTable.GetTable();
+        return new FanTable(table.Select((v, i) => Math.Max(v, minimum[i])).ToArray());
     }
 
     private async Task ApplyOcIfNeededAsync(GodModeSettings.GodModeSettingsStore.Preset preset)
@@ -996,7 +1040,18 @@ public class GodModeController(
         return Task.FromResult(fanTable);
     }
 
+    /// <summary>
+    /// Minimum the fan curve editor allows. The software fan curve can go below the hardware minimum.
+    /// </summary>
     public async Task<FanTable> GetMinimumFanTableAsync()
+    {
+        if (await SoftwareFanCurveController.DetectHardwareCustomModeBlockedAsync().ConfigureAwait(false))
+            return new FanTable([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        return await GetHardwareMinimumFanTableAsync().ConfigureAwait(false);
+    }
+
+    private async Task<FanTable> GetHardwareMinimumFanTableAsync()
     {
         var config = await GetConfigAsync().ConfigureAwait(false);
         return config.Platform switch
@@ -1015,7 +1070,17 @@ public class GodModeController(
 
         try
         {
-            return await GetFanTableDataLegionAsync().ConfigureAwait(false);
+            var fanTableData = await GetFanTableDataLegionAsync().ConfigureAwait(false);
+
+            // Show the thresholds the software fan curve actually uses instead of the BIOS "unused step" markers.
+            if (fanTableData is not null && await SoftwareFanCurveController.DetectHardwareCustomModeBlockedAsync().ConfigureAwait(false))
+            {
+                fanTableData = fanTableData
+                    .Select(d => new FanTableData(d.Type, d.FanId, d.SensorId, d.FanSpeeds, SoftwareFanCurveController.NormalizeTemps(d.Temps)))
+                    .ToArray();
+            }
+
+            return fanTableData;
         }
         catch (Exception ex)
         {
@@ -1376,9 +1441,11 @@ public class GodModeController(
         return null;
     }
 
-    protected async Task<bool> IsValidFanTableAsync(FanTable fanTable)
+    protected async Task<bool> IsValidFanTableAsync(FanTable fanTable, bool forHardware = true)
     {
-        var minimumFanTable = await GetMinimumFanTableAsync().ConfigureAwait(false);
+        var minimumFanTable = forHardware
+            ? await GetHardwareMinimumFanTableAsync().ConfigureAwait(false)
+            : await GetMinimumFanTableAsync().ConfigureAwait(false);
         var minimum = minimumFanTable.GetTable();
         return fanTable.GetTable().Where((t, i) => t < minimum[i] || t > 10u).IsEmpty();
     }
@@ -1390,7 +1457,7 @@ public class GodModeController(
         Log.Instance.Trace($"Fan table data retrieved.");
 
         var fanTable = preset.FanTable ?? await GetDefaultFanTableAsync().ConfigureAwait(false);
-        if (!await IsValidFanTableAsync(fanTable).ConfigureAwait(false))
+        if (!await IsValidFanTableAsync(fanTable, forHardware: false).ConfigureAwait(false))
         {
             Log.Instance.Trace($"Fan table invalid, replacing with default...");
             fanTable = await GetDefaultFanTableAsync().ConfigureAwait(false);

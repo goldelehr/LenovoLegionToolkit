@@ -8,6 +8,7 @@ using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
 using LenovoLegionToolkit.Lib;
+using LenovoLegionToolkit.Lib.Controllers;
 using LenovoLegionToolkit.Lib.Extensions;
 using LenovoLegionToolkit.Lib.Utils;
 using LenovoLegionToolkit.WPF.Resources;
@@ -341,7 +342,9 @@ public partial class FanCurveControlV2
                 if (temp >= 127)
                     return "-";
 
-                var rpm = value < 0 ? 0 : tableData.FanSpeeds[value];
+                var rpm = value >= 0
+                    ? tableData.FanSpeeds[value]
+                    : SoftwareFanCurveController.IsHardwareCustomModeBlockedCached ? SoftwareFanCurveController.MINIMUM_STABLE_SPEED : 0;
                 return $"{temp}{Resource.Celsius} @ {rpm} {Resource.RPM}";
             }
             catch

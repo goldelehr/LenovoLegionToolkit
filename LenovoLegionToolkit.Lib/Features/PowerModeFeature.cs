@@ -23,7 +23,8 @@ public class PowerModeFeature(
     WindowsPowerModeController windowsPowerModeController,
     WindowsPowerPlanController windowsPowerPlanController,
     ThermalModeListener thermalModeListener,
-    PowerModeListener powerModeListener)
+    PowerModeListener powerModeListener,
+    SoftwareFanCurveController softwareFanCurveController)
     : AbstractWmiFeature<PowerModeState>(WMI.LenovoGameZoneData.GetSmartFanModeAsync, WMI.LenovoGameZoneData.SetSmartFanModeAsync, WMI.LenovoGameZoneData.IsSupportSmartFanAsync, 1)
 {
     public bool AllowAllPowerModesOnBattery { get; set; }
@@ -67,6 +68,11 @@ public class PowerModeFeature(
         var currentState = await GetStateAsync().ConfigureAwait(false);
 
         Log.Instance.Trace($"Switching power mode: {currentState} -> {state}");
+
+        if (state != PowerModeState.GodMode)
+        {
+            await softwareFanCurveController.StopAsync().ConfigureAwait(false);
+        }
 
         var mi = await Compatibility.GetMachineInformationAsync().ConfigureAwait(false);
 

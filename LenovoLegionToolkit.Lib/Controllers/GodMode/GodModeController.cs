@@ -1100,6 +1100,8 @@ public class GodModeController(
             {
                 (1, 1) => FanTableType.CPU,
                 (2, 5) => FanTableType.GPU,
+                // APU-only models (e.g. Strix Halo) drive the second fan from the APU sensor
+                (2, 1) => FanTableType.GPU,
                 (1, 4) => FanTableType.PCH,
                 _ => FanTableType.Unknown,
             };
@@ -1108,7 +1110,7 @@ public class GodModeController(
         return (fanId, sensorId) switch
         {
             (1, 1) or (1, 4) => FanTableType.CPU,
-            (2, 5) => FanTableType.GPU,
+            (2, 5) or (2, 1) => FanTableType.GPU,
             (4, 4) or (5, 5) or (4, 1) => FanTableType.PCH,
             _ => FanTableType.Unknown,
         };

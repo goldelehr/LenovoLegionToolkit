@@ -31,9 +31,26 @@ public class SoftwareFanCurveController
     /// whether it blocks custom mode while in Custom or Performance mode, so the answer is cached.
     /// </summary>
     public static bool IsHardwareCustomModeBlockedCached { get; private set; }
-    private const int HYSTERESIS = 3;
+
     private const int EMERGENCY_TEMPERATURE = 90;
     private const int MAX_INVALID_READINGS = 3;
+
+    // APU temperatures swing by several degrees within seconds. Without damping, a curve with a steep
+    // section makes the fans jump back and forth between two speeds, and lowering the speed heats the
+    // APU up again, which closes a feedback loop. The following constants tame that:
+
+    /// <summary>Smoothing factor per tick for rising temperatures (reacts within a few seconds).</summary>
+    private const double RISE_ALPHA = 0.4;
+    /// <summary>Smoothing factor per tick for falling temperatures (time constant of roughly 20 s).</summary>
+    private const double FALL_ALPHA = 0.1;
+    /// <summary>After speeding up, the fans keep at least that speed for this long.</summary>
+    private static readonly TimeSpan HOLD_AFTER_INCREASE = TimeSpan.FromSeconds(30);
+    /// <summary>Maximum speed change per tick when speeding up (300 RPM/s).</summary>
+    private const int MAX_RAMP_UP_PER_TICK = 600;
+    /// <summary>Maximum speed change per tick when slowing down (75 RPM/s).</summary>
+    private const int MAX_RAMP_DOWN_PER_TICK = 150;
+    /// <summary>Speed changes smaller than this are not sent to the EC, and do not restart the hold time.</summary>
+    private const int DEADBAND = 100;
 
     private readonly Lock _lock = new();
 
@@ -139,8 +156,13 @@ public class SoftwareFanCurveController
 
     private async Task RunAsync(ushort[] levels, ushort[] temps, ushort[] fan1Speeds, ushort[] fan2Speeds, CancellationToken token)
     {
-        var currentStep = -1;
+        var fan1Curve = GetCurveSpeeds(levels, fan1Speeds);
+        var fan2Curve = GetCurveSpeeds(levels, fan2Speeds);
+
         var invalidReadings = 0;
+        double? smoothedTemperature = null;
+        var lastIncrease = DateTime.MinValue;
+        int? fan1 = null, fan2 = null;
         int? lastFan1 = null, lastFan2 = null;
 
         try
@@ -161,7 +183,8 @@ public class SoftwareFanCurveController
                     {
                         Log.Instance.Trace($"Invalid temperature readings, handing fans back to EC. [temperature={temperature}]");
                         await ReleaseAsync().ConfigureAwait(false);
-                        lastFan1 = lastFan2 = null;
+                        fan1 = fan2 = lastFan1 = lastFan2 = null;
+                        smoothedTemperature = null;
                     }
 
                     await Task.Delay(INTERVAL_MS, token).ConfigureAwait(false);
@@ -170,26 +193,37 @@ public class SoftwareFanCurveController
 
                 invalidReadings = 0;
 
-                int fan1, fan2;
                 if (temperature >= EMERGENCY_TEMPERATURE)
                 {
+                    // The emergency path uses the raw reading and skips all damping.
+                    smoothedTemperature = temperature;
                     fan1 = fan1Speeds.Max();
                     fan2 = fan2Speeds.Max();
-                    currentStep = temps.Length - 1;
+                    lastIncrease = DateTime.UtcNow;
                 }
                 else
                 {
-                    currentStep = GetStep(temps, temperature, currentStep);
-                    var level = Math.Clamp((int)levels[currentStep], 0, 10);
-                    fan1 = level == 0 ? MINIMUM_STABLE_SPEED : fan1Speeds[level - 1];
-                    fan2 = level == 0 ? MINIMUM_STABLE_SPEED : fan2Speeds[level - 1];
+                    smoothedTemperature = Smooth(smoothedTemperature, temperature);
+
+                    var desired1 = Interpolate(temps, fan1Curve, smoothedTemperature.Value);
+                    var desired2 = Interpolate(temps, fan2Curve, smoothedTemperature.Value);
+
+                    var holdDown = DateTime.UtcNow - lastIncrease < HOLD_AFTER_INCREASE;
+                    var next1 = Ramp(fan1, desired1, holdDown);
+                    var next2 = Ramp(fan2, desired2, holdDown);
+
+                    if (next1 - (fan1 ?? next1) >= DEADBAND || next2 - (fan2 ?? next2) >= DEADBAND)
+                        lastIncrease = DateTime.UtcNow;
+
+                    fan1 = next1;
+                    fan2 = next2;
                 }
 
-                if (fan1 != lastFan1 || fan2 != lastFan2)
+                if (ShouldSend(fan1.Value, lastFan1) || ShouldSend(fan2.Value, lastFan2))
                 {
-                    Log.Instance.Trace($"Software fan curve: {temperature}°C -> step {currentStep}, fan1={fan1}, fan2={fan2}");
-                    await WMI.LenovoOtherMethod.SetFeatureValueAsync(CapabilityID.CpuCurrentFanSpeed, fan1).ConfigureAwait(false);
-                    await WMI.LenovoOtherMethod.SetFeatureValueAsync(CapabilityID.GpuCurrentFanSpeed, fan2).ConfigureAwait(false);
+                    Log.Instance.Trace($"Software fan curve: {temperature}°C (smoothed {smoothedTemperature:0.0}°C) -> fan1={fan1}, fan2={fan2}");
+                    await WMI.LenovoOtherMethod.SetFeatureValueAsync(CapabilityID.CpuCurrentFanSpeed, fan1.Value).ConfigureAwait(false);
+                    await WMI.LenovoOtherMethod.SetFeatureValueAsync(CapabilityID.GpuCurrentFanSpeed, fan2.Value).ConfigureAwait(false);
                     _hasTargets = true;
                     lastFan1 = fan1;
                     lastFan2 = fan2;
@@ -209,24 +243,63 @@ public class SoftwareFanCurveController
         }
     }
 
-    /// <summary>
-    /// Highest step whose threshold is reached. Moving down requires the temperature to drop
-    /// <see cref="HYSTERESIS"/> degrees below the current step's threshold to avoid oscillation.
-    /// </summary>
-    private static int GetStep(ushort[] temps, int temperature, int currentStep)
+    /// <summary>Fan speed of each curve point; level 0 maps to <see cref="MINIMUM_STABLE_SPEED"/>.</summary>
+    private static int[] GetCurveSpeeds(ushort[] levels, ushort[] fanSpeeds) => levels
+        .Select(l => Math.Clamp((int)l, 0, 10))
+        .Select(l => l == 0 ? MINIMUM_STABLE_SPEED : fanSpeeds[l - 1])
+        .ToArray();
+
+    /// <summary>Follows rising temperatures quickly and falling ones slowly.</summary>
+    private static double Smooth(double? smoothed, int temperature)
     {
-        var step = 0;
-        for (var i = 0; i < temps.Length; i++)
+        if (smoothed is not { } previous)
+            return temperature;
+
+        var alpha = temperature > previous ? RISE_ALPHA : FALL_ALPHA;
+        return previous + alpha * (temperature - previous);
+    }
+
+    /// <summary>
+    /// Linear interpolation between the curve points, so the speed changes gradually
+    /// instead of jumping when a threshold is crossed.
+    /// </summary>
+    internal static int Interpolate(ushort[] temps, int[] speeds, double temperature)
+    {
+        if (temperature <= temps[0])
+            return speeds[0];
+
+        for (var i = 0; i < temps.Length - 1; i++)
         {
-            if (temperature >= temps[i])
-                step = i;
+            if (temperature >= temps[i + 1] || temps[i + 1] <= temps[i])
+                continue;
+
+            var fraction = (temperature - temps[i]) / (temps[i + 1] - temps[i]);
+            return (int)Math.Round(speeds[i] + fraction * (speeds[i + 1] - speeds[i]));
         }
 
-        if (currentStep > step && temperature > temps[currentStep] - HYSTERESIS)
-            return currentStep;
-
-        return step;
+        return speeds[^1];
     }
+
+    /// <summary>
+    /// Moves the current speed towards the desired one with limited slope. While
+    /// <paramref name="holdDown"/> is set (shortly after speeding up), the speed is not lowered.
+    /// </summary>
+    private static int Ramp(int? current, int desired, bool holdDown)
+    {
+        if (current is not { } value)
+            return desired;
+
+        if (desired > value)
+            return Math.Min(desired, value + MAX_RAMP_UP_PER_TICK);
+
+        if (desired < value && !holdDown)
+            return Math.Max(desired, value - MAX_RAMP_DOWN_PER_TICK);
+
+        return value;
+    }
+
+    private static bool ShouldSend(int speed, int? lastSent) =>
+        lastSent is not { } last || (speed != last && Math.Abs(speed - last) >= DEADBAND);
 
     /// <summary>
     /// The BIOS marks unused steps with 127°C. Spread them out above the last real threshold

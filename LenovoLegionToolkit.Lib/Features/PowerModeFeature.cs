@@ -24,7 +24,8 @@ public class PowerModeFeature(
     WindowsPowerPlanController windowsPowerPlanController,
     ThermalModeListener thermalModeListener,
     PowerModeListener powerModeListener,
-    SoftwareFanCurveController softwareFanCurveController)
+    SoftwareFanCurveController softwareFanCurveController,
+    SmuPowerLimitController smuPowerLimitController)
     : AbstractWmiFeature<PowerModeState>(WMI.LenovoGameZoneData.GetSmartFanModeAsync, WMI.LenovoGameZoneData.SetSmartFanModeAsync, WMI.LenovoGameZoneData.IsSupportSmartFanAsync, 1)
 {
     public bool AllowAllPowerModesOnBattery { get; set; }
@@ -72,6 +73,8 @@ public class PowerModeFeature(
         if (state != PowerModeState.GodMode)
         {
             await softwareFanCurveController.StopAsync().ConfigureAwait(false);
+            // The BIOS applies the limits of the new mode itself.
+            await smuPowerLimitController.StopAsync().ConfigureAwait(false);
         }
 
         var mi = await Compatibility.GetMachineInformationAsync().ConfigureAwait(false);

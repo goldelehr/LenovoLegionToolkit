@@ -407,6 +407,7 @@ public partial class App
         await SafeExecuteAsync<BatteryDischargeRateMonitorService>(c => c.StopAsync());
         await SafeExecuteAsync<ExtensionManager>(c => c.StopAsync());
         await SafeExecuteAsync<SoftwareFanCurveController>(c => c.StopAsync());
+        await SafeExecuteAsync<SmuPowerLimitController>(c => c.StopAsync(restoreBiosLimits: true));
         await SafeExecuteAsync<GodModeController>(c => c.RestoreDefaultsInOtherPowerModeAsync(PowerModeState.Balance));
 
         var feature = IoCContainer.Resolve<AmdOverclockingController>();

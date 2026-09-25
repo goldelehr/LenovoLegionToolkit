@@ -20,7 +20,8 @@ public class GodModeController(
     VantageDisabler vantageDisabler,
     LegionZoneDisabler legionZoneDisabler,
     LegionSpaceDisabler legionSpaceDisabler,
-    SoftwareFanCurveController softwareFanCurveController)
+    SoftwareFanCurveController softwareFanCurveController,
+    SmuPowerLimitController smuPowerLimitController)
     : IGodModeController
 {
     private const uint CAPABILITY_ID_MASK = 0xFFFF00FF;
@@ -361,6 +362,11 @@ public class GodModeController(
                         value -= 55;
                     }
 
+                    if (cap.PropertyName is nameof(GodModePreset.CPULongTermPowerLimit) or nameof(GodModePreset.CPUShortTermPowerLimit) or nameof(GodModePreset.CPUPeakPowerLimit))
+                    {
+                        value = await ClampToBiosRangeAsync(cap.RawId, value.Value).ConfigureAwait(false);
+                    }
+
                     await SetCapabilityValueAsync(cap, value.Value, config.CapabilityIdMask).ConfigureAwait(false);
                 }
                 catch (Exception ex)
@@ -388,6 +394,11 @@ public class GodModeController(
                     }
                 }
             }
+        }
+
+        if (config.Platform == GodModePlatform.Legion)
+        {
+            await ApplySmuPowerLimitsAsync(preset).ConfigureAwait(false);
         }
 
         if (preset.FanTable != null && config.Platform != GodModePlatform.NonGaming)
@@ -681,10 +692,107 @@ public class GodModeController(
         }
 
         var preset = PopulatePreset(config, stepperValues, fanTableInfo, fanFullSpeed, 0, 0, pboScaler, pboFreq, coreCurve, enableAllCoreCurve, enableOverclocking);
+        preset = await WidenPowerLimitRangesAsync(preset).ConfigureAwait(false);
 
         Log.Instance.Trace($"Default state retrieved: {preset}");
         return preset;
     }
+
+    #region SMU Power Limits
+
+    /// <summary>
+    /// With SMU power limits the CPU limits can go below the BIOS minimum. While the BIOS refuses the real
+    /// custom mode (power adapter not recognized), the maximum is capped at the SMU limits the firmware itself
+    /// applies on that adapter. Long term maps to STAPM, short term to the slow and peak to the fast limit.
+    /// </summary>
+    private async Task<GodModePreset> WidenPowerLimitRangesAsync(GodModePreset preset)
+    {
+        if (!await smuPowerLimitController.IsSupportedAsync().ConfigureAwait(false))
+            return preset;
+
+        var caps = await GetAdapterPowerLimitCapsAsync().ConfigureAwait(false);
+
+        return preset with
+        {
+            CPULongTermPowerLimit = Widen(preset.CPULongTermPowerLimit, caps?.Stapm),
+            CPUShortTermPowerLimit = Widen(preset.CPUShortTermPowerLimit, caps?.Slow),
+            CPUPeakPowerLimit = Widen(preset.CPUPeakPowerLimit, caps?.Fast),
+        };
+
+        static StepperValue? Widen(StepperValue? value, int? cap)
+        {
+            if (value is not { Step: > 0 } v)
+                return value;
+
+            var max = cap is { } c ? Math.Min(v.Max, c) : v.Max;
+            return new StepperValue(Math.Clamp(v.Value, SmuPowerLimitController.MINIMUM_WATTS, max), SmuPowerLimitController.MINIMUM_WATTS, max, v.Step, v.Steps, v.DefaultValue);
+        }
+    }
+
+    /// <summary>Firmware SMU limits while the BIOS blocks the real custom mode, otherwise null (no cap).</summary>
+    private async Task<SmuPowerLimitController.Limits?> GetAdapterPowerLimitCapsAsync()
+    {
+        if (!await SoftwareFanCurveController.DetectHardwareCustomModeBlockedAsync().ConfigureAwait(false))
+            return null;
+
+        return await smuPowerLimitController.GetFirmwareLimitsAsync().ConfigureAwait(false);
+    }
+
+    private async Task ApplySmuPowerLimitsAsync(GodModeSettings.GodModeSettingsStore.Preset preset)
+    {
+        try
+        {
+            if (!await smuPowerLimitController.IsSupportedAsync().ConfigureAwait(false))
+                return;
+
+            if (preset.CPULongTermPowerLimit?.Value is not { } stapm
+                || preset.CPUShortTermPowerLimit?.Value is not { } slow
+                || preset.CPUPeakPowerLimit?.Value is not { } fast)
+            {
+                await smuPowerLimitController.StopAsync(restoreBiosLimits: true).ConfigureAwait(false);
+                return;
+            }
+
+            // Enforced here as well, the UI range may have been built before the adapter check was known.
+            if (await SoftwareFanCurveController.IsHardwareCustomModeBlockedAsync().ConfigureAwait(false))
+            {
+                if (await smuPowerLimitController.GetFirmwareLimitsAsync().ConfigureAwait(false) is not { } caps)
+                {
+                    Log.Instance.Trace($"Firmware SMU limits unknown, not applying SMU power limits.");
+                    await smuPowerLimitController.StopAsync().ConfigureAwait(false);
+                    return;
+                }
+
+                stapm = Math.Min(stapm, caps.Stapm);
+                slow = Math.Min(slow, caps.Slow);
+                fast = Math.Min(fast, caps.Fast);
+            }
+
+            await smuPowerLimitController.ApplyAsync(stapm, slow, fast).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Instance.Trace($"Failed to apply SMU power limits.", ex);
+        }
+    }
+
+    private readonly Dictionary<uint, (int Min, int Max)> _biosCapabilityRanges = [];
+
+    /// <summary>The BIOS keeps getting the values, limited to the range it reports itself.</summary>
+    private async Task<int> ClampToBiosRangeAsync(uint rawId, int value)
+    {
+        if (_biosCapabilityRanges.Count == 0)
+        {
+            foreach (var c in await WMI.LenovoCapabilityData01.ReadAsync().ConfigureAwait(false))
+                _biosCapabilityRanges[(uint)c.Id] = (c.Min, c.Max);
+        }
+
+        return _biosCapabilityRanges.TryGetValue(rawId, out var range) && range.Max > 0
+            ? Math.Clamp(value, range.Min, range.Max)
+            : value;
+    }
+
+    #endregion
 
     private static GodModePreset PopulatePreset(
         GodModePlatformConfiguration config,

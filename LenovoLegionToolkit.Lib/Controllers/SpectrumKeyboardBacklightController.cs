@@ -453,8 +453,21 @@ public class SpectrumKeyboardBacklightController
         Log.Instance.Trace($"Aurora stopped.");
     }
 
+    // Some keyboards (e.g. 048D:C115 in the Legion 7 15ASH11) don't support reading back the current key colors:
+    // the state response contains key codes that are not part of the keyboard's own key map and changes on every
+    // read, which made the preview flicker wildly. Such readbacks are detected and the preview is disabled.
+    private const int MAX_IMPLAUSIBLE_STATE_READS = 3;
+    private HashSet<ushort>? _knownKeyCodes;
+    private int _implausibleStateReads;
+
+    /// <summary>False once the keyboard returned implausible color readbacks several times in a row.</summary>
+    public bool IsStateReadbackSupported { get; private set; } = true;
+
     public async Task<Dictionary<ushort, RGBColor>> GetStateAsync(bool skipVantageCheck = false)
     {
+        if (!IsStateReadbackSupported)
+            return [];
+
         if (!skipVantageCheck)
             await ThrowIfVantageEnabled().ConfigureAwait(false);
 
@@ -470,6 +483,24 @@ public class SpectrumKeyboardBacklightController
         {
             var rgb = new RGBColor(key.Color.R, key.Color.G, key.Color.B);
             dict.TryAdd(key.KeyCode, rgb);
+        }
+
+        if (_knownKeyCodes is { Count: > 0 } known)
+        {
+            var unknown = dict.Keys.Count(k => !known.Contains(k));
+            if (unknown > Math.Max(2, dict.Count / 10))
+            {
+                if (++_implausibleStateReads >= MAX_IMPLAUSIBLE_STATE_READS)
+                {
+                    IsStateReadbackSupported = false;
+                    Log.Instance.Trace($"Keyboard color readback looks unsupported, disabling it. [unknownKeys={unknown}, keys={dict.Count}]");
+                }
+
+                return [];
+            }
+
+            _implausibleStateReads = 0;
+            return dict.Where(kv => known.Contains(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value);
         }
 
         return dict;
@@ -494,6 +525,9 @@ public class SpectrumKeyboardBacklightController
         foreach (var keyCode in keyMap.AdditionalKeyCodes)
             if (keyCode > 0)
                 keyCodes.Add(keyCode);
+
+        if (keyCodes.Count > 0)
+            _knownKeyCodes = keyCodes;
 
         return (keyMap.Width, keyMap.Height, keyCodes);
     }

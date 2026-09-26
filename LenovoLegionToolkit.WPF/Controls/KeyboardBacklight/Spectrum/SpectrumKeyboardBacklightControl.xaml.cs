@@ -481,6 +481,15 @@ public partial class SpectrumKeyboardBacklightControl
                 var delay = Task.Delay(_refreshStateInterval, token);
                 var state = await Task.Run(() => _controller.GetStateAsync(!firstCheck), token);
 
+                if (!_controller.IsStateReadbackSupported)
+                {
+                    foreach (var button in buttons)
+                        button.Color = null;
+                    if (ambientButton is not null)
+                        ambientButton.Color = null;
+                    break;
+                }
+
                 foreach (var button in buttons)
                 {
                     if (!state.TryGetValue(button.KeyCode, out var rgb))
